@@ -2,9 +2,11 @@
 
 The opensearch-go transport exposes a pull-based metrics API that returns a point-in-time snapshot of request counters, connection pool state, per-connection health, policy-level breakdowns, and router cache state. All fields are JSON-tagged for easy serialization.
 
+Metrics come in two tiers. The **per-request counters** (`requests`, `failures`, and responses-by-status) are always collected via lock-free atomics and returned by `Metrics()` regardless of configuration. The **detailed-metrics snapshot** (connection-pool state, per-connection health, per-policy breakdowns, and router cache state) is opt-in behind `EnableMetrics`.
+
 ## Quick Start
 
-Metrics collection is opt-in. Set `EnableMetrics: true` on `opensearch.Config`; without it, `client.Metrics()` returns `"transport metrics not enabled"`. When constructing through `opensearchapi.NewClient`, set the flag on the embedded `opensearch.Config` and reach the method via `apiClient.Client.Metrics()`.
+The per-request counters require no configuration. To also populate the detailed-metrics snapshot, set `EnableMetrics: true` on `opensearch.Config`. When constructing through `opensearchapi.NewClient`, set the flag on the embedded `opensearch.Config` and reach the method via `apiClient.Client.Metrics()`.
 
 ```go
 client, err := opensearch.NewClient(opensearch.Config{
@@ -24,7 +26,7 @@ data, _ := json.MarshalIndent(m, "", "  ")
 fmt.Println(string(data))
 ```
 
-The `Metrics()` method lives on `opensearch.Client`. It returns an `opensearchtransport.Metrics` struct and an error -- non-nil when metrics are disabled or a snapshot callback fails.
+The `Metrics()` method lives on `opensearch.Client`. It returns an `opensearchtransport.Metrics` struct and an error -- non-nil when a detailed-metrics snapshot callback fails. A `New()`-constructed transport always returns the per-request counters, so `Metrics()` does not error merely because `EnableMetrics` is unset.
 
 ---
 
@@ -249,6 +251,6 @@ The metrics API is pull-based: call `client.Metrics()` inside your collector's `
 
 ## Observer API
 
-For event-driven observability (as opposed to polling), implement the `opensearchtransport.ConnectionObserver` interface and set it on the `Observer` field of `opensearch.Config`. The observer receives callbacks for connection lifecycle events (promote, demote, overload), routing decisions, health checks, and shard map invalidations. See the [routing guide](routing.md) for details on observer events.
+For event-driven observability (as opposed to polling), implement the `opensearchtransport.ConnectionObserver` interface and set it on the `Observer` field of `opensearch.Config`. The observer receives callbacks for connection lifecycle events (promote, demote, overload), routing decisions, health checks, and shard map invalidations. See the [routing guide](transport-routing.md) for details on observer events.
 
 The metrics API and observer API are complementary: metrics give you aggregate snapshots for dashboards, while the observer gives you per-event detail for tracing and debugging.
