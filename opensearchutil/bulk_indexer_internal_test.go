@@ -527,15 +527,14 @@ func TestBulkIndexerContext(t *testing.T) {
 				ctx, cancel := context.WithCancel(context.Background())
 				cancel()
 
-				// select{} chooses randomly between the two ready cases when the
-				// queue still has room, so we cannot assert every Add fails. We can
-				// assert the bookkeeping invariant: each Add ends up in exactly one
-				// of NumAdded or BulkAddFailCount, never both, never neither.
+				// With the ring-buffer design, Add with a cancelled context
+				// always returns ctx.Err() because the context check happens
+				// deterministically before the ring-buffer write.
 				const numAttempts = 50
-				var nilReturns, errReturns uint64
+				var errReturns uint64
 				for range numAttempts {
 					if err := bi.Add(ctx, BulkIndexerItem{Action: "index", DocumentID: "cancelled"}); err == nil {
-						nilReturns++
+						t.Fatal("expected error from Add with cancelled context")
 					} else {
 						require.ErrorIs(t, err, context.Canceled)
 						errReturns++
@@ -544,10 +543,9 @@ func TestBulkIndexerContext(t *testing.T) {
 				require.NoError(t, bi.Close(context.Background()))
 
 				stats := bi.Stats()
-				require.Equal(t, nilReturns, stats.NumAdded, "NumAdded must equal the number of Add() calls that returned nil")
+				require.Equal(t, uint64(0), stats.NumAdded, "NumAdded must be zero when context is always cancelled")
 				require.Equal(t, errReturns, stats.BulkAddFailCount, "BulkAddFailCount must equal the number of Add() calls that returned ctx.Err()")
-				require.Equal(t, uint64(numAttempts), stats.NumAdded+stats.BulkAddFailCount, "every Add() must be accounted for exactly once")
-				require.Positive(t, errReturns, "at least one Add() should fail when context is already cancelled")
+				require.Equal(t, uint64(numAttempts), stats.BulkAddFailCount, "every Add() must be accounted for exactly once")
 			},
 		},
 		{
@@ -993,6 +991,315 @@ func TestBulkIndexerCallbacks(t *testing.T) {
 			tt.run(t)
 		})
 	}
+}
+
+// ---------- Flush-specific tests ----------
+
+func TestBulkIndexerFlush_basic(t *testing.T) {
+	client, _ := opensearchapi.NewClient(opensearchapi.Config{Client: opensearch.Config{Transport: &mockTransport{
+		RoundTripFunc: func(request *http.Request) (*http.Response, error) {
+			if request.URL.Path != "/_bulk" {
+				return infoResponse()
+			}
+			// Read the body to count items
+			body, _ := io.ReadAll(request.Body)
+			lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+			n := len(lines) / 2
+			items := make([]string, n)
+			for i := range items {
+				items[i] = `{"index":{}}`
+			}
+			resp := fmt.Sprintf(`{"items":[%s]}`, strings.Join(items, ","))
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(resp)),
+			}, nil
+		},
+	}}})
+
+	bi, err := NewBulkIndexer(BulkIndexerConfig{
+		NumWorkers:    1,
+		FlushInterval: time.Hour,
+		Client:        client,
+	})
+	require.NoError(t, err)
+
+	for i := 0; i < 5; i++ {
+		require.NoError(t, bi.Add(context.Background(), BulkIndexerItem{
+			Action: "index",
+			Body:   strings.NewReader(fmt.Sprintf(`{"title":"doc-%d"}`, i)),
+		}))
+	}
+
+	require.NoError(t, bi.Flush(context.Background()))
+
+	stats := bi.Stats()
+	require.Equal(t, uint64(5), stats.NumFlushed, "NumFlushed")
+	require.Equal(t, uint64(5), stats.NumAdded, "NumAdded")
+}
+
+func TestBulkIndexerFlush_concurrent(t *testing.T) {
+	var mu sync.Mutex
+	var totalItems int
+
+	client, _ := opensearchapi.NewClient(opensearchapi.Config{Client: opensearch.Config{Transport: &mockTransport{
+		RoundTripFunc: func(request *http.Request) (*http.Response, error) {
+			if request.URL.Path != "/_bulk" {
+				return infoResponse()
+			}
+			// Read the body to count items
+			body, _ := io.ReadAll(request.Body)
+			lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+			// Each item is 2 lines (meta + body)
+			n := len(lines) / 2
+			mu.Lock()
+			totalItems += n
+			mu.Unlock()
+
+			// Build response with correct number of items
+			items := make([]string, n)
+			for i := range items {
+				items[i] = `{"index":{}}`
+			}
+			resp := fmt.Sprintf(`{"items":[%s]}`, strings.Join(items, ","))
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(resp)),
+			}, nil
+		},
+	}}})
+
+	bi, err := NewBulkIndexer(BulkIndexerConfig{
+		NumWorkers:    1,
+		FlushInterval: time.Hour,
+		Client:        client,
+	})
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	for g := 0; g < 2; g++ {
+		go func(gid int) {
+			defer wg.Done()
+			for i := 0; i < 10; i++ {
+				require.NoError(t, bi.Add(context.Background(), BulkIndexerItem{
+					Action: "index",
+					Body:   strings.NewReader(fmt.Sprintf(`{"g":%d,"i":%d}`, gid, i)),
+				}))
+			}
+			require.NoError(t, bi.Flush(context.Background()))
+		}(g)
+	}
+
+	wg.Wait()
+
+	// Final flush to ensure everything is counted
+	require.NoError(t, bi.Flush(context.Background()))
+
+	stats := bi.Stats()
+	require.Equal(t, uint64(20), stats.NumAdded, "NumAdded")
+	require.Equal(t, uint64(20), stats.NumFlushed, "NumFlushed")
+
+	require.NoError(t, bi.Close(context.Background()))
+}
+
+func TestBulkIndexerFlush_thenAdd(t *testing.T) {
+	var reqCount atomic.Int32
+
+	client, _ := opensearchapi.NewClient(opensearchapi.Config{Client: opensearch.Config{Transport: &mockTransport{
+		RoundTripFunc: func(request *http.Request) (*http.Response, error) {
+			if request.URL.Path != "/_bulk" {
+				return infoResponse()
+			}
+			reqCount.Add(1)
+			// Read the body to count items
+			body, _ := io.ReadAll(request.Body)
+			lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+			n := len(lines) / 2
+			items := make([]string, n)
+			for i := range items {
+				items[i] = `{"index":{}}`
+			}
+			resp := fmt.Sprintf(`{"items":[%s]}`, strings.Join(items, ","))
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(resp)),
+			}, nil
+		},
+	}}})
+
+	bi, err := NewBulkIndexer(BulkIndexerConfig{
+		NumWorkers:    1,
+		FlushInterval: time.Hour,
+		Client:        client,
+	})
+	require.NoError(t, err)
+
+	// First Flush with no items should be a no-op.
+	require.NoError(t, bi.Flush(context.Background()))
+
+	// Add 3 items and flush.
+	for i := 0; i < 3; i++ {
+		require.NoError(t, bi.Add(context.Background(), BulkIndexerItem{
+			Action: "index",
+			Body:   strings.NewReader(fmt.Sprintf(`{"batch":1,"i":%d}`, i)),
+		}))
+	}
+	require.NoError(t, bi.Flush(context.Background()))
+	stats := bi.Stats()
+	require.Equal(t, uint64(3), stats.NumFlushed, "NumFlushed after first batch")
+
+	// Add 3 more items and flush again.
+	for i := 0; i < 3; i++ {
+		require.NoError(t, bi.Add(context.Background(), BulkIndexerItem{
+			Action: "index",
+			Body:   strings.NewReader(fmt.Sprintf(`{"batch":2,"i":%d}`, i)),
+		}))
+	}
+	require.NoError(t, bi.Flush(context.Background()))
+	stats = bi.Stats()
+	// Both batches have been flushed by now.
+	require.Equal(t, uint64(6), stats.NumFlushed, "NumFlushed after second batch")
+
+	require.NoError(t, bi.Close(context.Background()))
+}
+
+func TestBulkIndexerFlush_contextCancelled(t *testing.T) {
+	// Transport that blocks forever, simulating a slow flush.
+	blockCh := make(chan struct{})
+	defer close(blockCh)
+
+	client, _ := opensearchapi.NewClient(opensearchapi.Config{Client: opensearch.Config{Transport: &mockTransport{
+		RoundTripFunc: func(request *http.Request) (*http.Response, error) {
+			if request.URL.Path != "/_bulk" {
+				return infoResponse()
+			}
+			<-blockCh // block forever
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(`{"items":[{"index":{}}]}`)),
+			}, nil
+		},
+	}}})
+
+	bi, err := NewBulkIndexer(BulkIndexerConfig{
+		NumWorkers:    1,
+		FlushInterval: time.Hour,
+		Client:        client,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, bi.Add(context.Background(), BulkIndexerItem{
+		Action: "index",
+		Body:   strings.NewReader(`{"title":"blocked"}`),
+	}))
+
+	// Use an already-cancelled context.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- bi.Flush(ctx)
+	}()
+
+	select {
+	case flushErr := <-done:
+		require.ErrorIs(t, flushErr, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Flush with cancelled context should not deadlock")
+	}
+}
+
+func TestBulkIndexerAddAfterClose(t *testing.T) {
+	client, _ := opensearchapi.NewClient(opensearchapi.Config{Client: opensearch.Config{Transport: &mockTransport{
+		RoundTripFunc: func(request *http.Request) (*http.Response, error) {
+			if request.URL.Path != "/_bulk" {
+				return infoResponse()
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(`{"items":[]}`)),
+			}, nil
+		},
+	}}})
+
+	bi, err := NewBulkIndexer(BulkIndexerConfig{
+		NumWorkers: 1,
+		Client:     client,
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, bi.Close(context.Background()))
+
+	// Add after Close must return an error, not panic.
+	addErr := bi.Add(context.Background(), BulkIndexerItem{Action: "index"})
+	require.Error(t, addErr, "Add after Close must return an error")
+
+	stats := bi.Stats()
+	require.Equal(t, uint64(1), stats.BulkAddFailCount, "BulkAddFailCount")
+}
+
+func TestBulkIndexerReuse(t *testing.T) {
+	client, _ := opensearchapi.NewClient(opensearchapi.Config{Client: opensearch.Config{Transport: &mockTransport{
+		RoundTripFunc: func(request *http.Request) (*http.Response, error) {
+			if request.URL.Path != "/_bulk" {
+				return infoResponse()
+			}
+			// Read the body to count items
+			body, _ := io.ReadAll(request.Body)
+			lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+			n := len(lines) / 2
+			items := make([]string, n)
+			for i := range items {
+				items[i] = `{"index":{}}`
+			}
+			resp := fmt.Sprintf(`{"items":[%s]}`, strings.Join(items, ","))
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Body:       io.NopCloser(strings.NewReader(resp)),
+			}, nil
+		},
+	}}})
+
+	bi, err := NewBulkIndexer(BulkIndexerConfig{
+		NumWorkers:    1,
+		FlushInterval: time.Hour,
+		Client:        client,
+	})
+	require.NoError(t, err)
+
+	// First batch: add 3 items and Flush.
+	for i := 0; i < 3; i++ {
+		require.NoError(t, bi.Add(context.Background(), BulkIndexerItem{
+			Action: "index",
+			Body:   strings.NewReader(fmt.Sprintf(`{"batch":1,"i":%d}`, i)),
+		}))
+	}
+	require.NoError(t, bi.Flush(context.Background()))
+	stats := bi.Stats()
+	require.Equal(t, uint64(3), stats.NumFlushed, "NumFlushed after first Flush")
+
+	// Second batch: add 3 more items and Flush. Indexer is reused.
+	for i := 0; i < 3; i++ {
+		require.NoError(t, bi.Add(context.Background(), BulkIndexerItem{
+			Action: "index",
+			Body:   strings.NewReader(fmt.Sprintf(`{"batch":2,"i":%d}`, i)),
+		}))
+	}
+	require.NoError(t, bi.Flush(context.Background()))
+	stats = bi.Stats()
+	require.Equal(t, uint64(6), stats.NumFlushed, "NumFlushed after second Flush")
+
+	// Close cleanly.
+	require.NoError(t, bi.Close(context.Background()))
 }
 
 func strPointer(s string) *string {

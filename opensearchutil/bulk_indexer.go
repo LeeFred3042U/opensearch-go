@@ -33,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/bits"
 	"net/http"
 	"runtime"
 	"strings"
@@ -68,6 +69,10 @@ type BulkIndexer interface {
 	// they must finish before the call to Close, eg. using sync.WaitGroup.
 	Add(context.Context, BulkIndexerItem) error
 
+	// Flush drains all submitted items without closing the indexer,
+	// so the indexer can be reused across invocations.
+	Flush(context.Context) error
+
 	// Close waits until all added items are flushed and closes the indexer.
 	Close(context.Context) error
 
@@ -80,6 +85,7 @@ type BulkIndexerConfig struct {
 	NumWorkers    int           // The number of workers. Defaults to runtime.NumCPU().
 	FlushBytes    int           // The flush threshold in bytes. Defaults to 5MB.
 	FlushInterval time.Duration // The flush threshold as duration. Defaults to 30sec.
+	QueueSize     int           // Ring buffer capacity; rounded up to next power-of-two. Default: NumWorkers * 16.
 
 	Client      *opensearchapi.Client  // The OpenSearch client.
 	DebugLogger BulkIndexerDebugLogger // An optional logger for debugging.
@@ -167,11 +173,25 @@ type BulkIndexerDebugLogger interface {
 
 type bulkIndexer struct {
 	wg      sync.WaitGroup
-	queue   chan BulkIndexerItem
 	workers []*worker
 	ticker  *time.Ticker
 	done    chan bool
 	stats   *bulkIndexerStats
+
+	// Ring buffer fields.
+	//
+	// Add claims a slot via claimSeq, writes the item, then advances
+	// publishSeq so the sequencer can see it. The sequencer reads items
+	// in order and advances commitSeq after dispatching each to a worker.
+	// Flush snapshots publishSeq and waits for commitSeq to catch up.
+	ring       []BulkIndexerItem
+	ringMask   uint64
+	claimSeq   atomic.Uint64 // next slot to claim (Add)
+	publishSeq atomic.Uint64 // next slot readable by sequencer
+	commitSeq  atomic.Uint64 // next slot to consume (sequencer done)
+	commitMu   sync.Mutex
+	commitCv   *sync.Cond
+	closing    atomic.Bool
 
 	metaPool         sync.Pool
 	metaPoolMaxBytes int
@@ -189,6 +209,14 @@ type bulkIndexerStats struct {
 	numUpdated       atomic.Uint64
 	numDeleted       atomic.Uint64
 	numRequests      atomic.Uint64
+}
+
+// nextPowerOfTwo returns the smallest power of two >= n.
+func nextPowerOfTwo(n int) int {
+	if n <= 1 {
+		return 1
+	}
+	return 1 << bits.Len(uint(n-1))
 }
 
 // NewBulkIndexer creates a new bulk indexer.
@@ -222,10 +250,17 @@ func NewBulkIndexer(cfg BulkIndexerConfig) (BulkIndexer, error) {
 		cfg.MetaBufferPoolMaxBytes = defaultMetaBufferPoolMaxBytes
 	}
 
+	if cfg.QueueSize == 0 {
+		cfg.QueueSize = cfg.NumWorkers * 16
+	}
+	ringSize := nextPowerOfTwo(cfg.QueueSize)
+
 	bi := bulkIndexer{
 		config:           cfg,
 		done:             make(chan bool),
 		stats:            &bulkIndexerStats{},
+		ring:             make([]BulkIndexerItem, ringSize),
+		ringMask:         uint64(ringSize - 1),
 		metaPoolMaxBytes: cfg.MetaBufferPoolMaxBytes,
 		metaPool: sync.Pool{
 			New: func() any {
@@ -234,6 +269,7 @@ func NewBulkIndexer(cfg BulkIndexerConfig) (BulkIndexer, error) {
 			},
 		},
 	}
+	bi.commitCv = sync.NewCond(&bi.commitMu)
 
 	bi.init(cfg.Context)
 
@@ -242,8 +278,16 @@ func NewBulkIndexer(cfg BulkIndexerConfig) (BulkIndexer, error) {
 
 // Add adds an item to the indexer.
 //
-// Adding an item after a call to Close() will panic.
+// Adding an item after a call to Close() will return an error.
 func (bi *bulkIndexer) Add(ctx context.Context, item BulkIndexerItem) error {
+	if bi.closing.Load() {
+		bi.stats.bulkAddFailCount.Add(1)
+		err := errors.New("bulk indexer is closed")
+		if bi.config.OnError != nil {
+			bi.config.OnError(ctx, err)
+		}
+		return err
+	}
 	select {
 	case <-ctx.Done():
 		bi.stats.bulkAddFailCount.Add(1)
@@ -251,29 +295,79 @@ func (bi *bulkIndexer) Add(ctx context.Context, item BulkIndexerItem) error {
 			bi.config.OnError(ctx, ctx.Err())
 		}
 		return ctx.Err()
-	case bi.queue <- item:
-		bi.stats.numAdded.Add(1)
+	default:
 	}
 
+	// Claim a ring slot.
+	seq := bi.claimSeq.Add(1) - 1
+
+	// Spin until there is room in the ring (back-pressure).
+	for seq-bi.commitSeq.Load() >= uint64(len(bi.ring)) {
+		runtime.Gosched()
+	}
+
+	// Write the item into the claimed slot.
+	bi.ring[seq&bi.ringMask] = item
+
+	// Publish: wait until all previous slots have been published
+	// (ensures the sequencer sees items in order).
+	for bi.publishSeq.Load() != seq {
+		runtime.Gosched()
+	}
+	bi.publishSeq.Store(seq + 1)
+
+	bi.stats.numAdded.Add(1)
 	return nil
 }
 
-// Close stops the periodic flush, closes the indexer queue channel,
-// notifies the done channel and calls flush on all writers.
+// Flush drains all submitted items without closing the indexer.
+// It waits for the sequencer to commit all currently published items,
+// then force-flushes every worker buffer to the server.
+func (bi *bulkIndexer) Flush(ctx context.Context) error {
+	w := bi.publishSeq.Load()
+	bi.commitMu.Lock()
+	for bi.commitSeq.Load() < w {
+		if ctx.Err() != nil {
+			bi.commitMu.Unlock()
+			return ctx.Err()
+		}
+		bi.commitCv.Wait()
+	}
+	bi.commitMu.Unlock()
+
+	// Force-flush any data still sitting in worker buffers.
+	for _, w := range bi.workers {
+		w.mu.Lock()
+		if w.buf.Len() > 0 {
+			if err := w.flush(ctx); err != nil {
+				w.mu.Unlock()
+				if bi.config.OnError != nil {
+					bi.config.OnError(ctx, err)
+				}
+
+				continue
+			}
+		}
+		w.mu.Unlock()
+	}
+	return nil
+}
+
+// Close stops the periodic flush, signals the sequencer to drain, waits for
+// all items to be committed, and flushes any remaining worker buffers.
 func (bi *bulkIndexer) Close(ctx context.Context) error {
 	bi.ticker.Stop()
-	close(bi.queue)
+	bi.closing.Store(true)
 	bi.done <- true
 
-	select {
-	case <-ctx.Done():
+	if err := bi.Flush(ctx); err != nil {
 		if bi.config.OnError != nil {
-			bi.config.OnError(ctx, ctx.Err())
+			bi.config.OnError(ctx, err)
 		}
-		return ctx.Err()
-	default:
-		bi.wg.Wait()
+		return err
 	}
+
+	bi.wg.Wait()
 
 	for _, w := range bi.workers {
 		w.mu.Lock()
@@ -309,22 +403,75 @@ func (bi *bulkIndexer) Stats() BulkIndexerStats {
 
 // init initializes the bulk indexer.
 func (bi *bulkIndexer) init(ctx context.Context) {
-	bi.queue = make(chan BulkIndexerItem, bi.config.NumWorkers)
-
 	for i := 1; i <= bi.config.NumWorkers; i++ {
 		w := worker{
 			id:  i,
-			ch:  bi.queue,
 			bi:  bi,
 			buf: bytes.NewBuffer(make([]byte, 0, bi.config.FlushBytes)),
 		}
-		w.run(ctx)
 		bi.workers = append(bi.workers, &w)
 	}
-	bi.wg.Add(bi.config.NumWorkers)
+	bi.wg.Add(1) // for the sequencer goroutine
 
 	bi.ticker = time.NewTicker(bi.config.FlushInterval)
 
+	// Sequencer goroutine: reads items from the ring buffer in order and
+	// distributes them to workers round-robin.
+	go func() {
+		defer bi.wg.Done()
+		var seq uint64
+		workerIdx := 0
+		for {
+			if bi.closing.Load() && seq >= bi.publishSeq.Load() {
+				return
+			}
+			for bi.publishSeq.Load() <= seq {
+				if bi.closing.Load() && seq >= bi.publishSeq.Load() {
+					return
+				}
+				runtime.Gosched()
+			}
+			item := bi.ring[seq&bi.ringMask]
+
+			w := bi.workers[workerIdx%len(bi.workers)]
+
+			w.mu.Lock()
+
+			if bi.config.DebugLogger != nil {
+				bi.config.DebugLogger.Printf("[worker-%03d] Received item [%s:%s]\n", w.id, item.Action,
+					item.DocumentID)
+			}
+
+			if err := w.writeMeta(item); err != nil {
+				if item.OnFailure != nil {
+					item.OnFailure(ctx, item, bulkRespItemForOnFailure(opensearchapi.BulkRespItem{}), err)
+				}
+				bi.stats.numFailed.Add(1)
+			} else if err := w.writeBody(ctx, &item); err != nil {
+				if item.OnFailure != nil {
+					item.OnFailure(ctx, item, bulkRespItemForOnFailure(opensearchapi.BulkRespItem{}), err)
+				}
+				bi.stats.numFailed.Add(1)
+			} else {
+				w.items = append(w.items, item)
+				if w.buf.Len() >= bi.config.FlushBytes {
+					if err := w.flush(ctx); err != nil && bi.config.OnError != nil {
+						bi.config.OnError(ctx, err)
+					}
+				}
+			}
+
+			w.mu.Unlock()
+
+			seq++
+			bi.commitSeq.Store(seq)
+			bi.commitCv.Broadcast()
+
+			workerIdx++
+		}
+	}()
+
+	// Ticker goroutine for periodic auto-flush.
 	go func() {
 		for {
 			select {
@@ -360,79 +507,10 @@ func (bi *bulkIndexer) init(ctx context.Context) {
 // worker represents an indexer worker.
 type worker struct {
 	id    int
-	ch    <-chan BulkIndexerItem
 	mu    sync.Mutex
 	bi    *bulkIndexer
 	buf   *bytes.Buffer
 	items []BulkIndexerItem
-}
-
-// run launches the worker in a goroutine.
-func (w *worker) run(ctx context.Context) {
-	go func() {
-		if w.bi.config.DebugLogger != nil {
-			w.bi.config.DebugLogger.Printf("[worker-%03d] Started\n", w.id)
-		}
-		defer w.bi.wg.Done()
-
-		for {
-			select {
-			case <-ctx.Done():
-				// Context cancelled, exit worker
-				if w.bi.config.DebugLogger != nil {
-					w.bi.config.DebugLogger.Printf("[worker-%03d] Context cancelled, stopping\n", w.id)
-				}
-				return
-			case item, ok := <-w.ch:
-				if !ok {
-					// Channel closed, exit worker
-					return
-				}
-
-				w.mu.Lock()
-
-				if w.bi.config.DebugLogger != nil {
-					w.bi.config.DebugLogger.Printf("[worker-%03d] Received item [%s:%s]\n", w.id, item.Action,
-						item.DocumentID)
-				}
-
-				if err := w.writeMeta(item); err != nil {
-					if item.OnFailure != nil {
-						item.OnFailure(ctx, item, bulkRespItemForOnFailure(opensearchapi.BulkRespItem{}), err)
-					}
-
-					w.bi.stats.numFailed.Add(1)
-					w.mu.Unlock()
-
-					continue
-				}
-
-				if err := w.writeBody(ctx, &item); err != nil {
-					if item.OnFailure != nil {
-						item.OnFailure(ctx, item, bulkRespItemForOnFailure(opensearchapi.BulkRespItem{}), err)
-					}
-					w.bi.stats.numFailed.Add(1)
-					w.mu.Unlock()
-
-					continue
-				}
-
-				w.items = append(w.items, item)
-				if w.buf.Len() >= w.bi.config.FlushBytes {
-					if err := w.flush(ctx); err != nil {
-						w.mu.Unlock()
-
-						if w.bi.config.OnError != nil {
-							w.bi.config.OnError(ctx, err)
-						}
-
-						continue
-					}
-				}
-				w.mu.Unlock()
-			}
-		}
-	}()
 }
 
 // writeMeta formats and writes the item metadata to the buffer; it must be called under a lock.
